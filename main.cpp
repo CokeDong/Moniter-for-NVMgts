@@ -72,7 +72,7 @@ int main()
     }
     //------------------------------------------------------------
     // initial socket
-    int sock_fd, client_fd;
+    int client_fd;
     struct sockaddr_in ser_addr;
     struct sockaddr_in cli_addr;
     char buffer[8 * 1024 * 1024]; // buffer
@@ -139,7 +139,7 @@ int main()
                     strcat(sendMsg,tempStr);
                     sprintf(tempStr, "%d:",numPoints);
                     strcat(sendMsg,tempStr);
-                    sprintf(tempStr, "%llf:", (endLoadTime - startLoadTime))/1000000;
+                    sprintf(tempStr, "%lf:", (endLoadTime - startLoadTime)/1000000);
                     strcat(sendMsg,tempStr);
                     strcat(sendMsg, ";");
                     strcat(sendMsg, "1;");
@@ -169,7 +169,7 @@ int main()
                 // only if this is true, batch query need to be check
                 int finishNum = shared[1]->dataInt[0];
                 double runningTimeOne = shared[1]->dataDou[3] - shared[1]->dataDou[2];
-                printf("Task %d finished using %llf s.\n",finishNum,runningTimeOne/1000000);
+                printf("Task %d finished using %lf s.\n",finishNum,runningTimeOne/1000000);
                 // send this message through socket
                 //.......
                 // maybe not need to return through socket because of the high latency of internet
@@ -177,14 +177,14 @@ int main()
                 if(allFinish)
                 {
                     double runningTimeBatch = shared[1]->dataDou[1] - shared[1]->dataDou[0];
-                    printf("All queries are finished using %llf s.\n",finishNum,runningTimeOne/1000000);
+                    printf("All queries are finished using %lf s.\n",runningTimeOne/1000000);
                     // send this message through socket
                     // for SENDBatch, format of msg is 1;time:;finishFlag=1;
                     char tempStr[1024*64];
                     // int strLen = 0+2+2;
                     memset(sendMsg,0,4*1024*1024);
                     strcat(sendMsg, "1;");
-                    sprintf(tempStr, "%llf:", runningTimeBatch/1000000);
+                    sprintf(tempStr, "%lf:", runningTimeBatch/1000000);
                     strcat(sendMsg,tempStr);
                     strcat(sendMsg, ";");
                     strcat(sendMsg, "1;");
@@ -213,7 +213,7 @@ int main()
             if(allFinish)
             {
                 double runningTime = shared[2]->dataDou[1] - shared[2]->dataDou[0];
-                printf("This query is finished using %llf s.\n", runningTime/1000000);
+                printf("This query is finished using %lf s.\n", runningTime/1000000);
                 // send this msg through socket
                 //......
                 char result[10000];
@@ -294,19 +294,45 @@ int main()
             // shm 5
             //-----------------------------------------------------
             // clean
-
+            if(sem_p(semid[5]))
+            {
+                printf("sem_p fail.\n");
+            }
+            if(shared[5]->flag[0]) // clean finished
+            {
+                    memset(sendMsg,0,sizeof(sendMsg));
+                    strcpy(sendMsg, "5;1:;1;"); // clean finish
+                    send(client_fd, sendMsg, strlen(sendMsg), 0);
+                    shared[5]->flag[0] = false;
+                    shared[5]->flag[1] = false;
+            }
+            if(sem_v(semid[5]))
+            {
+                printf("sem_v fail.\n");
+            }
             // shm 6
             //-----------------------------------------------------
             // demo
+            if(sem_p(semid[6]))
+            {
+                printf("sem_p fail.\n");
+            }
+            if(shared[6]->flag[0]) // demo finish
+            {
+                    double startTime = shared[6]->dataDou[0];
+                    double endTime = shared[6]->dataDou[1];
+                    memset(sendMsg,0,sizeof(sendMsg));
+                    sprintf(sendMsg, "6;%lf:;1;",(endTime - startTime)/1000000);
+                    send(client_fd, sendMsg, strlen(sendMsg), 0);
+                    shared[6]->flag[0] = false;
+                    shared[6]->flag[1] = false;
+            }
+            if(sem_v(semid[6]))
+            {
+                printf("sem_v fail.\n");
+            }
 
-            //---------------------------------------------------------
-            // need demo? get from socket.
-
-
-            // --------------------------------------------------------
-            // need close?
-            // if socket say close, set closeMe=1
-
+            // -----------------------------------------------------------------------------
             // recv socket from GUI
             memset(buffer,0, sizeof(buffer));
             int lenRecv = recv(client_fd, buffer, sizeof(buffer), 0);
@@ -316,12 +342,22 @@ int main()
                 memcpy(msg,buffer, sizeof(buffer));
                 int msgType = socketMsgHandler(msg);
                 // ....
+                if(msgType == 13) // close app
+                {
+                    memset(sendMsg, 0, sizeof(sendMsg));
+                    strcpy(sendMsg, "13;;1;");
+                    send(client_fd, sendMsg, strlen(sendMsg), 0);
+                    // kill process of NVMGTS
+                    closeMe = 1;
+                    break;
+                }
             }
         }
     }
 
-    // clean database and kill it
     // close socket.....
+    close(client_fd);
+    close(ser_sockfd);
     // close shm,semaphore....
     for(int i=0; i<SMTYPE_NUM; i++)
     {
@@ -336,7 +372,6 @@ int main()
         if(del_sem(semid[i]))
             printf("delete sem fail.\n");
     }
-
 
     return 0;
 
@@ -400,7 +435,7 @@ int socketMsgHandler(char* msg)
             printf("sem_p fail.\n");
         }
         char* MBRinfo = strtok(NULL, ";");
-        char* flag = strtok(NULL,";");
+        // char* flag = strtok(NULL,";");
         double xmin,xmax,ymin,ymax;
         char* temp;
         temp = strtok(MBRinfo, ",");
@@ -520,6 +555,7 @@ int socketMsgHandler(char* msg)
         break;
     }
     }
+    return msgType;
 }
 
 int creat_sem(key_t key)

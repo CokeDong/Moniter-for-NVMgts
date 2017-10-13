@@ -19,7 +19,7 @@ typedef struct SMDATA
     double dataDou[4];
     int type;
     char stringData[10000];
-    bool flag[2];
+    bool flag[3];
     int dataInt[4];
 } SMDATA;
 
@@ -35,14 +35,18 @@ static int set_semvalue(int semid);
 static int sem_p(int semid);
 static int sem_v(int semid);
 static int del_sem(int semid);
+int socketMsgHandler(char* msg);
+
+void* shm[SMTYPE_NUM] = {NULL};
+SMDATA *shared[SMTYPE_NUM] = {NULL};
+int shmid[SMTYPE_NUM];
+int semid[SMTYPE_NUM];
+int nowState = -1;// 0-7 is real state; -1 is not do anything..
 
 int main()
 {
     cout << "Hello world!" << endl;
-    void* shm[SMTYPE_NUM] = {NULL};
-    SMDATA *shared[SMTYPE_NUM] = {NULL};
-    int shmid[SMTYPE_NUM];
-    int semid[SMTYPE_NUM];
+
     //-------------------------------------------------
     // initial shm and semaphore
     for(int i=0; i<SMTYPE_NUM; i++)
@@ -64,6 +68,7 @@ int main()
         set_semvalue(semid[i]);
         shared[i]->flag[0] = false;
         shared[i]->flag[1] = false;
+        shared[i]->flag[2] = false;
     }
     //------------------------------------------------------------
     // initial socket
@@ -101,6 +106,7 @@ int main()
     {
         // start service.
         char sendMsg[4*1024*1024];
+        nowState = -1;
         while(!closeMe)
         {
             // shm 0
@@ -142,28 +148,6 @@ int main()
                     // after finish loading, set flag to false
                     shared[0]->flag[0] = false;
                     shared[0]->flag[1] = false;
-                }
-            }
-            else
-            {
-                //check if a socket saying start loading
-                memset(buffer,0, sizeof(buffer));
-                int len = recv(client_fd, buffer, sizeof(buffer), 0);
-                // for LOAD, format of msg is 0;fileName;finishFlag;
-                if(len > 0)
-                {
-                    char* temp = NULL;
-                    temp = strtok(buffer,";");
-                    if(atoi(temp) == 0)
-                    {
-                        // start loading
-                        temp = strtok(NULL, ";"); // file Name
-                        char cmd[100];
-                        strcat(cmd , "./test l ");
-                        strcat(cmd, temp);
-                        system(cmd); // !!!! need GTS support this api and send data through share mem
-                        shared[0]->flag[1] = true;
-                    }
                 }
             }
             if(sem_v(semid[0]))
@@ -210,33 +194,70 @@ int main()
                 }
 
             }
+            // batch from client to gts is implemented in socket
+
             if(sem_v(semid[1]))
             {
                 printf("sem_v fail.\n");
             }
+
+
             // shm 2
             //-----------------------------------------------------
-            // batch from client to gts
+            // single from gts to client
+            if(sem_p(semid[2]))
+            {
+                printf("sem_p fail.\n");
+            }
+            allFinish = shared[2]->flag[0];
+            if(allFinish)
+            {
+                double runningTime = shared[2]->dataDou[1] - shared[2]->dataDou[0];
+                printf("This query is finished using %llf s.\n", runningTime/1000000);
+                // send this msg through socket
+                //......
+                char result[10000];
+                strcpy(result, shared[2]->stringData);
+                memset(sendMsg, 0, sizeof(sendMsg));
+                strcat(sendMsg, "2;");
+                strcat(sendMsg, result);
+                strcat(sendMsg, ";");
+                strcat(sendMsg, "1;");
+                send(client_fd, sendMsg, strlen(sendMsg), 0);
+                shared[2]->flag[0] = false;
+                shared[2]->flag[1] = false;
+            }
 
-            // look for socket
-            // if there is a call
-            // .........
+
+            if(sem_v(semid[2]))
+            {
+                printf("sem_v fail.\n");
+            }
 
             // shm 3
             //-----------------------------------------------------
-            // single from gts to client
+            // change mode of system
+            // get mode result from system
             if(sem_p(semid[3]))
             {
                 printf("sem_p fail.\n");
             }
-            allFinish = shared[3]->flag[0];
-            if(allFinish)
+            if(shared[3]->flag[0])
             {
-                double runningTime = shared[3]->dataDou[1] - shared[3]->dataDou[0];
-                printf("This query is finished using %llf s.\n", runningTime/1000000);
-                // send this msg through socket
-                //......
-                shared[3]->flag[0] = false;
+                if(shared[3]->flag[1])
+                {
+                    char modeNow;
+                    modeNow = shared[3]->stringData[0];
+                    char msg[10] = {0};
+                    sprintf(msg, "%c;",modeNow);
+                    memset(sendMsg,0,sizeof(sendMsg));
+                    strcat(sendMsg, "3;");
+                    strcat(sendMsg, msg);
+                    strcat(sendMsg, "1;");
+                    send(client_fd, sendMsg, strlen(sendMsg), 0);
+                    shared[3]->flag[0] = false;
+                    shared[3]->flag[1] = false;
+                }
             }
             if(sem_v(semid[3]))
             {
@@ -244,18 +265,39 @@ int main()
             }
             // shm 4
             //-----------------------------------------------------
-            // single from client to gts
-
-            // look for socket
-            // if ......
+            // sys State
+            if(sem_p(semid[4]))
+            {
+                printf("sem_p fail.\n");
+            }
+            if(shared[4]->flag[0]) // a new state
+            {
+                    numTrajs = shared[4]->dataInt[0];
+                    numPoints = shared[4]->dataInt[1];
+                    char tempStr[100];
+                    int queryIdNow = shared[4]->dataInt[2];
+                    char modeNow = shared[4]->stringData[0];
+                    memset(sendMsg,0,sizeof(sendMsg));
+                    strcat(sendMsg,"4;");
+                    sprintf(tempStr, "%d:%d:%c:%d:%d:;",numTrajs,numPoints,modeNow, queryIdNow,nowState);
+                    strcat(sendMsg, tempStr);
+                    strcat(sendMsg, "1;");
+                    send(client_fd, sendMsg, strlen(sendMsg), 0);
+                    shared[4]->flag[0] = false;
+                    shared[4]->flag[1] = false;
+            }
+            if(sem_v(semid[4]))
+            {
+                printf("sem_v fail.\n");
+            }
 
             // shm 5
             //-----------------------------------------------------
-            // get status of system
+            // clean
 
             // shm 6
             //-----------------------------------------------------
-            // clean data
+            // demo
 
             //---------------------------------------------------------
             // need demo? get from socket.
@@ -265,8 +307,16 @@ int main()
             // need close?
             // if socket say close, set closeMe=1
 
-
-
+            // recv socket from GUI
+            memset(buffer,0, sizeof(buffer));
+            int lenRecv = recv(client_fd, buffer, sizeof(buffer), 0);
+            if(lenRecv > 0)
+            {
+                char* msg = new char[8*1024*1024];
+                memcpy(msg,buffer, sizeof(buffer));
+                int msgType = socketMsgHandler(msg);
+                // ....
+            }
         }
     }
 
@@ -293,6 +343,184 @@ int main()
 }
 
 
+/*
+handle all socket msg
+return msg text in char* msg, and return the type for int
+*/
+int socketMsgHandler(char* msg)
+{
+
+    // for LOAD, format of msg is 0;fileName;finishFlag;
+    char* temp = NULL;
+    temp = strtok(msg,";");
+    int msgType = atoi(temp);
+    switch(msgType)
+    {
+    case 0: // load data
+    {
+        if(sem_p(semid[0]))
+        {
+            printf("sem_p fail.\n");
+        }
+        temp = strtok(NULL, ";"); // file Name
+        memset(shared[0]->stringData,0,1000);
+        strcpy(shared[0]->stringData, temp);
+        shared[0]->flag[1] = true; //start Flag
+        shared[0]->flag[0] = false;
+        nowState = 0;
+        if(sem_v(semid[0]))
+        {
+            printf("sem_v fail.\n");
+        }
+        break;
+    }
+    case 1: // batch query
+    {
+        if(sem_p(semid[1]))
+        {
+            printf("sem_p fail.\n");
+        }
+        char* batchFileName = strtok(NULL, ";");
+        memset(shared[1]->stringData,0,1000);
+        strcpy(shared[1]->stringData, batchFileName);
+        shared[1]->flag[2] = true; //start Batch
+        shared[1]->flag[0] = false;
+        shared[1]->flag[1] = false;
+        nowState = 1;
+        if(sem_v(semid[1]))
+        {
+            printf("sem_v fail.\n");
+        }
+        break;
+    }
+    case 2: // single query
+    {
+        if(sem_p(semid[2]))
+        {
+            printf("sem_p fail.\n");
+        }
+        char* MBRinfo = strtok(NULL, ";");
+        char* flag = strtok(NULL,";");
+        double xmin,xmax,ymin,ymax;
+        char* temp;
+        temp = strtok(MBRinfo, ",");
+        xmin = atof(temp);
+        temp = strtok(NULL, ",");
+        xmax = atof(temp);
+        temp = strtok(NULL, ",");
+        ymin = atof(temp);
+        temp = strtok(NULL, ",");
+        ymax = atof(temp);
+        shared[2]->dataDou[0] = xmin;
+        shared[2]->dataDou[1] = xmax;
+        shared[2]->dataDou[2] = ymin;
+        shared[2]->dataDou[3] = ymax;
+        shared[2]->flag[0] = false;
+        shared[2]->flag[1] = true; // gotoSingle
+        nowState = 2;
+        if(sem_v(semid[2]))
+        {
+            printf("sem_v fail.\n");
+        }
+        break;
+    }
+    case 3: // change mode
+    {
+        if(sem_p(semid[3]))
+        {
+            printf("sem_p fail.\n");
+        }
+        char* modeStr = strtok(NULL, ";");
+        shared[3]->stringData[0] = modeStr[0];
+        shared[3]->flag[0] = true;
+        shared[3]->flag[1] = false;
+        nowState = 3;
+        if(sem_v(semid[3]))
+        {
+            printf("sem_v fail.\n");
+        }
+        break;
+    }
+    case 4: //sysState
+    {
+        if(sem_p(semid[4]))
+        {
+            printf("sem_p fail.\n");
+        }
+        // get sysState and send out
+        //not implement here, periodically in main
+        if(sem_v(semid[4]))
+        {
+            printf("sem_v fail.\n");
+        }
+        break;
+    }
+    case 5: // clean
+    {
+        if(sem_p(semid[5]))
+        {
+            printf("sem_p fail.\n");
+        }
+        if((shared[5]->flag[1]==0)) // not in clean
+        {
+            shared[5]->flag[1] = true;
+            shared[5]->flag[0] = false;
+            nowState = 5;
+        }
+        if(sem_v(semid[5]))
+        {
+            printf("sem_v fail.\n");
+        }
+        break;
+    }
+    case 6: //demo
+    {
+        if(sem_p(semid[6]))
+        {
+            printf("sem_p fail.\n");
+        }
+        if((shared[6]->flag[1]==0)) // not in demo
+        {
+            shared[6]->flag[1] = true;
+            shared[6]->flag[0] = false;
+            nowState = 6;
+            // batch -> interrupt -> recovery -> batch -> output recovery time
+            if(sem_v(semid[6]))
+            {
+                printf("sem_v fail.\n");
+            }
+            // start batch
+            if(sem_p(semid[1]))
+            {
+                printf("sem_p fail.\n");
+            }
+            shared[1]->flag[2] = true; //start Batch
+            shared[1]->flag[0] = false;
+            shared[1]->flag[1] = false;
+            if(sem_v(semid[1]))
+            {
+                printf("sem_v fail.\n");
+            }
+            // interrupt
+            // kill process
+            // recovery process ./test l
+            // waiting for finish, go to while
+        }
+        else
+        {
+            if(sem_v(semid[6]))
+            {
+                printf("sem_v fail.\n");
+            }
+        }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+}
 
 int creat_sem(key_t key)
 {

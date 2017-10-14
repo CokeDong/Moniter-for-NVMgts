@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <errno.h>
 
 
 using namespace std;
@@ -30,11 +31,11 @@ union semun
     unsigned short *array;
 };
 
-static int creat_sem(key_t key);
-static int set_semvalue(int semid);
-static int sem_p(int semid);
-static int sem_v(int semid);
-static int del_sem(int semid);
+int creat_sem(key_t key);
+int set_semvalue(int semid);
+int sem_p(int semid);
+int sem_v(int semid);
+int del_sem(int semid);
 int socketMsgHandler(char* msg);
 
 void* shm[SMTYPE_NUM] = {NULL};
@@ -42,6 +43,7 @@ SMDATA *shared[SMTYPE_NUM] = {NULL};
 int shmid[SMTYPE_NUM];
 int semid[SMTYPE_NUM];
 int nowState = -1;// 0-7 is real state; -1 is not do anything..
+
 
 int main()
 {
@@ -51,7 +53,7 @@ int main()
     // initial shm and semaphore
     for(int i=0; i<SMTYPE_NUM; i++)
     {
-        shmid[i] = shmget((key_t)i,sizeof(SMDATA),0666|IPC_CREAT);
+        shmid[i] = shmget((key_t)i+1,sizeof(SMDATA),0666|IPC_CREAT);
         if(shmid[i] == -1)
         {
             // fail
@@ -68,25 +70,27 @@ int main()
         set_semvalue(semid[i]);
         shared[i]->flag[0] = false;
         shared[i]->flag[1] = false;
-        shared[i]->flag[2] = false;
+        shared[i]->flag[2] = true;
     }
+    shared[4]->dataInt[3] = -1;
     //------------------------------------------------------------
     // initial socket
+
     int client_fd;
     struct sockaddr_in ser_addr;
     struct sockaddr_in cli_addr;
-    char buffer[8 * 1024 * 1024]; // buffer
+    char buffer[256 * 1024]; // buffer
     int ser_sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0); // non-block mode
     if(ser_sockfd<0)
     {
         // fail
         printf("fail to create socket.\n");
     }
-    socklen_t addrlen = sizeof(struct sockaddr_in);
-    bzero(&ser_addr, addrlen);
+
+    //bzero(&ser_addr, addrlen);
     ser_addr.sin_family = AF_INET;
     ser_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    ser_addr.sin_port = htonl(SERVER_PORT);
+    ser_addr.sin_port = htons(SERVER_PORT);
     if(bind(ser_sockfd, (struct sockaddr*)&ser_addr,sizeof(struct sockaddr_in))<0)
     {
         printf("bind error.\n");
@@ -96,268 +100,342 @@ int main()
         printf("listen fail.\n");
         close(ser_sockfd);
     }
+    socklen_t addrlen = sizeof(struct sockaddr_in);
     int closeMe = 0;
     int numTrajs = 0,numPoints = 0;
-
-    client_fd = accept(ser_sockfd, (struct sockaddr*)&cli_addr,&addrlen);
-    if(client_fd<=0)
-        printf("Accept error.\n");
-    else
+    printf("tes>>>>%d\n",EWOULDBLOCK);
+    while(true)
     {
-        // start service.
-        char sendMsg[4*1024*1024];
-        nowState = -1;
-        while(!closeMe)
+        client_fd = accept4(ser_sockfd, (struct sockaddr*)&cli_addr, &addrlen,SOCK_NONBLOCK);
+
+        if(client_fd<0)
         {
-            // shm 0
-            //--------------------------------------------------------
-            // load data
-            bool haveFinisedLoad, haveStartedLoad;
-            if(sem_p(semid[0]))
+            if(errno == EWOULDBLOCK)
             {
-                printf("sem_p fail.\n");
+                sleep(1);
+                continue;
             }
-            haveStartedLoad = shared[0]->flag[1];
-            if(haveStartedLoad)
+            else
             {
-                // check if finish
-                haveFinisedLoad = shared[0]->flag[0];
-                if(haveFinisedLoad)
-                {
-                    numTrajs = shared[0]->dataInt[0];
-                    numPoints = shared[0]->dataInt[1];
-                    double startLoadTime,endLoadTime;
-                    startLoadTime = shared[0]->dataDou[0];
-                    endLoadTime = shared[0]->dataDou[1];
-                    // send info about num through socket
-
-                    char tempStr[1024*64];
-                    // int strLen = 0+2+2;
-                    memset(sendMsg,0,4*1024*1024);
-                    strcat(sendMsg, "0;");
-                    sprintf(tempStr, "%d:", numTrajs);
-                    strcat(sendMsg,tempStr);
-                    sprintf(tempStr, "%d:",numPoints);
-                    strcat(sendMsg,tempStr);
-                    sprintf(tempStr, "%lf:", (endLoadTime - startLoadTime)/1000000);
-                    strcat(sendMsg,tempStr);
-                    strcat(sendMsg, ";");
-                    strcat(sendMsg, "1;");
-                    send(client_fd, sendMsg, strlen(sendMsg) +1, 0); // send message
-
-                    // after finish loading, set flag to false
-                    shared[0]->flag[0] = false;
-                    shared[0]->flag[1] = false;
-                }
+                printf("Accept error: %d .\n",client_fd);
+                close(ser_sockfd);
             }
-            if(sem_v(semid[0]))
-            {
-                printf("sem_v fail.\n");
-            }
-            // shm 1
-            //-----------------------------------------------------
-            // batch from gts to client
-            if(sem_p(semid[1]))
-            {
-                printf("sem_p fail.\n");
-            }
-            bool allFinish,finishOne;
-            allFinish = shared[1]->flag[0];
-            finishOne = shared[1]->flag[1];
-            if(finishOne)
-            {
-                // only if this is true, batch query need to be check
-                int finishNum = shared[1]->dataInt[0];
-                double runningTimeOne = shared[1]->dataDou[3] - shared[1]->dataDou[2];
-                printf("Task %d finished using %lf s.\n",finishNum,runningTimeOne/1000000);
-                // send this message through socket
-                //.......
-                // maybe not need to return through socket because of the high latency of internet
-                shared[1]->flag[1] = false;
-                if(allFinish)
-                {
-                    double runningTimeBatch = shared[1]->dataDou[1] - shared[1]->dataDou[0];
-                    printf("All queries are finished using %lf s.\n",runningTimeOne/1000000);
-                    // send this message through socket
-                    // for SENDBatch, format of msg is 1;time:;finishFlag=1;
-                    char tempStr[1024*64];
-                    // int strLen = 0+2+2;
-                    memset(sendMsg,0,4*1024*1024);
-                    strcat(sendMsg, "1;");
-                    sprintf(tempStr, "%lf:", runningTimeBatch/1000000);
-                    strcat(sendMsg,tempStr);
-                    strcat(sendMsg, ";");
-                    strcat(sendMsg, "1;");
-                    send(client_fd, sendMsg, strlen(sendMsg) +1, 0); // send message
-                    //........
-                    shared[1]->flag[0] = false;
-                }
-
-            }
-            // batch from client to gts is implemented in socket
-
-            if(sem_v(semid[1]))
-            {
-                printf("sem_v fail.\n");
-            }
+        }
+        else
+            break;
+    }
 
 
-            // shm 2
-            //-----------------------------------------------------
-            // single from gts to client
-            if(sem_p(semid[2]))
+
+    // start service.
+    char sendMsg[256*1024];
+    nowState = -1;
+    //system("/home/zbw/NVMgts_Interative/NVMgts/testGTS &");
+    while(!closeMe)
+    {
+        // shm 0
+        //--------------------------------------------------------
+        // load data
+        bool haveFinisedLoad, haveStartedLoad;
+        if(sem_p(semid[0]))
+        {
+            printf("sem_p fail.\n");
+        }
+
+        haveStartedLoad = shared[0]->flag[1];
+        if(haveStartedLoad)
+        {
+            // check if finish
+            haveFinisedLoad = shared[0]->flag[0];
+//            //DEBUG
+//            //debug
+//            if(shared[0]->flag[1])
+//            {
+//                char DebugMsg[100] = "0;12:144:0.46:;1;";
+//                shared[0]->flag[0] = false;
+//                shared[0]->flag[1] = false;
+//                send(client_fd, DebugMsg, strlen(DebugMsg), 0);
+//            }
+//            //debug
+//            //DEBUG
+            if(haveFinisedLoad)
             {
-                printf("sem_p fail.\n");
-            }
-            allFinish = shared[2]->flag[0];
-            if(allFinish)
-            {
-                double runningTime = shared[2]->dataDou[1] - shared[2]->dataDou[0];
-                printf("This query is finished using %lf s.\n", runningTime/1000000);
-                // send this msg through socket
-                //......
-                char result[10000];
-                strcpy(result, shared[2]->stringData);
-                memset(sendMsg, 0, sizeof(sendMsg));
-                strcat(sendMsg, "2;");
-                strcat(sendMsg, result);
+                numTrajs = shared[0]->dataInt[0];
+                numPoints = shared[0]->dataInt[1];
+                double startLoadTime,endLoadTime;
+                startLoadTime = shared[0]->dataDou[0];
+                endLoadTime = shared[0]->dataDou[1];
+                // send info about num through socket
+
+                char tempStr[1024*64];
+                // int strLen = 0+2+2;
+                memset(sendMsg,0,2*1024*1024);
+                strcat(sendMsg, "0;");
+                sprintf(tempStr, "%d:", numTrajs);
+                strcat(sendMsg,tempStr);
+                sprintf(tempStr, "%d:",numPoints);
+                strcat(sendMsg,tempStr);
+                sprintf(tempStr, "%lf:", (endLoadTime - startLoadTime)/1000000);
+                strcat(sendMsg,tempStr);
                 strcat(sendMsg, ";");
                 strcat(sendMsg, "1;");
+                send(client_fd, sendMsg, strlen(sendMsg) +1, 0); // send message
+
+                // after finish loading, set flag to false
+                shared[0]->flag[0] = false;
+                shared[0]->flag[1] = false;
+            }
+        }
+        if(sem_v(semid[0]))
+        {
+            printf("sem_v fail.\n");
+        }
+        // shm 1
+        //-----------------------------------------------------
+        // batch from gts to client
+        if(sem_p(semid[1]))
+        {
+            printf("sem_p fail.\n");
+        }
+        bool allFinish,finishOne;
+        allFinish = shared[1]->flag[0];
+        finishOne = shared[1]->flag[1];
+        if(finishOne)
+        {
+            // only if this is true, batch query need to be check
+            int finishNum = shared[1]->dataInt[0];
+            double runningTimeOne = shared[1]->dataDou[3] - shared[1]->dataDou[2];
+            printf("Task %d finished using %lf s.\n",finishNum,runningTimeOne/1000000);
+            // send this message through socket
+            //.......
+            // maybe not need to return through socket because of the high latency of internet
+            shared[1]->flag[1] = false;
+            if(allFinish)
+            {
+                double runningTimeBatch = shared[1]->dataDou[1] - shared[1]->dataDou[0];
+                printf("All queries are finished using %lf s.\n",runningTimeOne/1000000);
+                // send this message through socket
+                // for SENDBatch, format of msg is 1;time:;finishFlag=1;
+                char tempStr[1024*64];
+                // int strLen = 0+2+2;
+                memset(sendMsg,0,2*1024*1024);
+                strcat(sendMsg, "1;");
+                sprintf(tempStr, "%lf:", runningTimeBatch/1000000);
+                strcat(sendMsg,tempStr);
+                strcat(sendMsg, ";");
+                strcat(sendMsg, "1;");
+                send(client_fd, sendMsg, strlen(sendMsg) +1, 0); // send message
+                //........
+                shared[1]->flag[0] = false;
+            }
+
+        }
+        // batch from client to gts is implemented in socket
+
+        if(sem_v(semid[1]))
+        {
+            printf("sem_v fail.\n");
+        }
+
+
+        // shm 2
+        //-----------------------------------------------------
+        // single from gts to client
+        if(sem_p(semid[2]))
+        {
+            printf("sem_p fail.\n");
+        }
+        allFinish = shared[2]->flag[0];
+        if(allFinish)
+        {
+            double runningTime = shared[2]->dataDou[1] - shared[2]->dataDou[0];
+            printf("This query is finished using %lf s.\n", runningTime/1000000);
+            // send this msg through socket
+            //......
+            char result[10000];
+            strcpy(result, shared[2]->stringData);
+            memset(sendMsg, 0, sizeof(sendMsg));
+            strcat(sendMsg, "2;");
+            strcat(sendMsg, result);
+            strcat(sendMsg, ";");
+            strcat(sendMsg, "1;");
+            send(client_fd, sendMsg, strlen(sendMsg), 0);
+            shared[2]->flag[0] = false;
+            shared[2]->flag[1] = false;
+        }
+
+
+        if(sem_v(semid[2]))
+        {
+            printf("sem_v fail.\n");
+        }
+
+        // shm 3
+        //-----------------------------------------------------
+        // change mode of system
+        // get mode result from system
+        if(sem_p(semid[3]))
+        {
+            printf("sem_p fail.\n");
+        }
+        if(shared[3]->flag[0])
+        {
+            if(shared[3]->flag[1])
+            {
+                char modeNow;
+                modeNow = shared[3]->stringData[0];
+                char msg[10] = {0};
+                sprintf(msg, "%c;",modeNow);
+                memset(sendMsg,0,sizeof(sendMsg));
+                strcat(sendMsg, "3;");
+                strcat(sendMsg, msg);
+                strcat(sendMsg, "1;");
                 send(client_fd, sendMsg, strlen(sendMsg), 0);
-                shared[2]->flag[0] = false;
-                shared[2]->flag[1] = false;
+                shared[3]->flag[0] = false;
+                shared[3]->flag[1] = false;
             }
+        }
+        if(sem_v(semid[3]))
+        {
+            printf("sem_v fail.\n");
+        }
+        // shm 4
+        //-----------------------------------------------------
+        // sys State
+        if(sem_p(semid[4]))
+        {
+            printf("sem_p fail.\n");
+        }
+        if(shared[4]->flag[0]) // a new state
+        {
+            numTrajs = shared[4]->dataInt[0];
+            numPoints = shared[4]->dataInt[1];
+            char tempStr[100];
+            int queryIdNow = shared[4]->dataInt[2];
+            nowState = shared[4]->dataInt[3];
+            char modeNow = shared[4]->stringData[0];
+            memset(sendMsg,0,sizeof(sendMsg));
+            strcat(sendMsg,"4;");
+            sprintf(tempStr, "%d:%d:%c:%d:%d:;",numTrajs,numPoints,modeNow, queryIdNow,nowState);
+            strcat(sendMsg, tempStr);
+            strcat(sendMsg, "1;");
+            send(client_fd, sendMsg, strlen(sendMsg), 0);
+            printf("state changed:");
+            printf("%s\n",sendMsg);
+            shared[4]->flag[0] = false;
+            shared[4]->flag[1] = false;
+        }
+        if(sem_v(semid[4]))
+        {
+            printf("sem_v fail.\n");
+        }
 
+        // shm 5
+        //-----------------------------------------------------
+        // clean
+        if(sem_p(semid[5]))
+        {
+            printf("sem_p fail.\n");
+        }
+        if(shared[5]->flag[0]) // clean finished
+        {
+            memset(sendMsg,0,sizeof(sendMsg));
+            strcpy(sendMsg, "5;1:;1;"); // clean finish
+            send(client_fd, sendMsg, strlen(sendMsg), 0);
+            shared[5]->flag[0] = false;
+            shared[5]->flag[1] = false;
+        }
+        if(sem_v(semid[5]))
+        {
+            printf("sem_v fail.\n");
+        }
+        // shm 6
+        //-----------------------------------------------------
+        // demo
+        if(sem_p(semid[6]))
+        {
+            printf("sem_p fail.\n");
+        }
+        if(shared[6]->flag[0]) // demo finish
+        {
+            double startTime = shared[6]->dataDou[0];
+            double endTime = shared[6]->dataDou[1];
+            memset(sendMsg,0,sizeof(sendMsg));
+            sprintf(sendMsg, "6;%lf:;1;",(endTime - startTime)/1000000);
+            send(client_fd, sendMsg, strlen(sendMsg), 0);
+            shared[6]->flag[0] = false;
+            shared[6]->flag[1] = false;
+        }
+        if(sem_v(semid[6]))
+        {
+            printf("sem_v fail.\n");
+        }
 
-            if(sem_v(semid[2]))
+        // -----------------------------------------------------------------------------
+        // recv socket from GUI
+        memset(buffer,0, sizeof(buffer));
+        int lenRecv = recv(client_fd, buffer, sizeof(buffer), 0);
+        if(lenRecv<0)
+        {
+            if(errno != EWOULDBLOCK)
             {
-                printf("sem_v fail.\n");
+                printf("recv error: %d.\n",errno);
             }
-
-            // shm 3
-            //-----------------------------------------------------
-            // change mode of system
-            // get mode result from system
-            if(sem_p(semid[3]))
+        }
+        if(lenRecv > 0)
+        {
+            char* msg = new char[2*1024*1024];
+            memcpy(msg,buffer, sizeof(buffer));
+            printf("[DEBUG]");
+            printf("%s\n",msg);
+            int msgType = socketMsgHandler(msg);
+            // ....
+            if(msgType == 13) // close app
             {
-                printf("sem_p fail.\n");
-            }
-            if(shared[3]->flag[0])
-            {
-                if(shared[3]->flag[1])
+                memset(sendMsg, 0, sizeof(sendMsg));
+                strcpy(sendMsg, "13;;1;");
+                send(client_fd, sendMsg, strlen(sendMsg), 0);
+                // kill process of NVMGTS
+                if(sem_p(semid[7]))
                 {
-                    char modeNow;
-                    modeNow = shared[3]->stringData[0];
-                    char msg[10] = {0};
-                    sprintf(msg, "%c;",modeNow);
-                    memset(sendMsg,0,sizeof(sendMsg));
-                    strcat(sendMsg, "3;");
-                    strcat(sendMsg, msg);
-                    strcat(sendMsg, "1;");
-                    send(client_fd, sendMsg, strlen(sendMsg), 0);
-                    shared[3]->flag[0] = false;
-                    shared[3]->flag[1] = false;
+                    printf("sem_p fail.\n");
                 }
-            }
-            if(sem_v(semid[3]))
-            {
-                printf("sem_v fail.\n");
-            }
-            // shm 4
-            //-----------------------------------------------------
-            // sys State
-            if(sem_p(semid[4]))
-            {
-                printf("sem_p fail.\n");
-            }
-            if(shared[4]->flag[0]) // a new state
-            {
-                    numTrajs = shared[4]->dataInt[0];
-                    numPoints = shared[4]->dataInt[1];
-                    char tempStr[100];
-                    int queryIdNow = shared[4]->dataInt[2];
-                    char modeNow = shared[4]->stringData[0];
-                    memset(sendMsg,0,sizeof(sendMsg));
-                    strcat(sendMsg,"4;");
-                    sprintf(tempStr, "%d:%d:%c:%d:%d:;",numTrajs,numPoints,modeNow, queryIdNow,nowState);
-                    strcat(sendMsg, tempStr);
-                    strcat(sendMsg, "1;");
-                    send(client_fd, sendMsg, strlen(sendMsg), 0);
-                    shared[4]->flag[0] = false;
-                    shared[4]->flag[1] = false;
-            }
-            if(sem_v(semid[4]))
-            {
-                printf("sem_v fail.\n");
-            }
-
-            // shm 5
-            //-----------------------------------------------------
-            // clean
-            if(sem_p(semid[5]))
-            {
-                printf("sem_p fail.\n");
-            }
-            if(shared[5]->flag[0]) // clean finished
-            {
-                    memset(sendMsg,0,sizeof(sendMsg));
-                    strcpy(sendMsg, "5;1:;1;"); // clean finish
-                    send(client_fd, sendMsg, strlen(sendMsg), 0);
-                    shared[5]->flag[0] = false;
-                    shared[5]->flag[1] = false;
-            }
-            if(sem_v(semid[5]))
-            {
-                printf("sem_v fail.\n");
-            }
-            // shm 6
-            //-----------------------------------------------------
-            // demo
-            if(sem_p(semid[6]))
-            {
-                printf("sem_p fail.\n");
-            }
-            if(shared[6]->flag[0]) // demo finish
-            {
-                    double startTime = shared[6]->dataDou[0];
-                    double endTime = shared[6]->dataDou[1];
-                    memset(sendMsg,0,sizeof(sendMsg));
-                    sprintf(sendMsg, "6;%lf:;1;",(endTime - startTime)/1000000);
-                    send(client_fd, sendMsg, strlen(sendMsg), 0);
-                    shared[6]->flag[0] = false;
-                    shared[6]->flag[1] = false;
-            }
-            if(sem_v(semid[6]))
-            {
-                printf("sem_v fail.\n");
-            }
-
-            // -----------------------------------------------------------------------------
-            // recv socket from GUI
-            memset(buffer,0, sizeof(buffer));
-            int lenRecv = recv(client_fd, buffer, sizeof(buffer), 0);
-            if(lenRecv > 0)
-            {
-                char* msg = new char[8*1024*1024];
-                memcpy(msg,buffer, sizeof(buffer));
-                int msgType = socketMsgHandler(msg);
-                // ....
-                if(msgType == 13) // close app
+                shared[7]->flag[1] = true;
+                shared[7]->flag[0] = false;
+                if(sem_v(semid[7]))
                 {
-                    memset(sendMsg, 0, sizeof(sendMsg));
-                    strcpy(sendMsg, "13;;1;");
-                    send(client_fd, sendMsg, strlen(sendMsg), 0);
-                    // kill process of NVMGTS
-                    closeMe = 1;
-                    break;
+                    printf("sem_v fail.\n");
+                }
+                // waiting for close
+                while(1)
+                {
+                    if(sem_p(semid[7]))
+                    {
+                        printf("sem_p fail.\n");
+                    }
+                    if(shared[7]->flag[0])
+                    {
+                        closeMe = 1;
+                        break;
+                    }
+                    else
+                    {
+                        sleep(3);
+                    }
+                    if(sem_v(semid[7]))
+                    {
+                        printf("sem_v fail.\n");
+                    }
                 }
             }
         }
     }
 
+
     // close socket.....
     close(client_fd);
     close(ser_sockfd);
+
     // close shm,semaphore....
     for(int i=0; i<SMTYPE_NUM; i++)
     {
@@ -397,9 +475,8 @@ int socketMsgHandler(char* msg)
         {
             printf("sem_p fail.\n");
         }
-        temp = strtok(NULL, ";"); // file Name
-        memset(shared[0]->stringData,0,1000);
-        strcpy(shared[0]->stringData, temp);
+        temp = strtok(NULL, ";"); // datafile No
+        shared[0]->dataInt[2] = atoi(temp);
         shared[0]->flag[1] = true; //start Flag
         shared[0]->flag[0] = false;
         nowState = 0;
@@ -510,6 +587,8 @@ int socketMsgHandler(char* msg)
     }
     case 6: //demo
     {
+        char* dataFileNoStr = strtok(NULL, ";");
+        int dataFileNo = atoi(dataFileNoStr);  // demo use file No. to run
         if(sem_p(semid[6]))
         {
             printf("sem_p fail.\n");
@@ -519,7 +598,8 @@ int socketMsgHandler(char* msg)
             shared[6]->flag[1] = true;
             shared[6]->flag[0] = false;
             nowState = 6;
-            // batch -> interrupt -> recovery -> batch -> output recovery time
+            shared[6]->dataInt[0] = dataFileNo;
+            // check fileNo -> batch -> interrupt -> recovery -> batch -> output recovery time
             if(sem_v(semid[6]))
             {
                 printf("sem_v fail.\n");
@@ -562,7 +642,7 @@ int creat_sem(key_t key)
 {
     int semid = 0;
 
-    semid = semget(key, 1, IPC_CREAT|0666);
+    semid = semget(key+1, 1, IPC_CREAT|0666);
     if(semid == -1)
     {
         printf("%s : semid = -1!\n",__func__);
